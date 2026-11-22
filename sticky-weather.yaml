@@ -1,0 +1,1051 @@
+# =====================================================================
+#  reTerminal Sticky weather panel (ESPHome)
+#  · Indoor temperature & humidity  → built-in SHT40 sensor
+#  · Outdoor weather                → Open-Meteo
+#  · Umbrella in the next hour?     → Buienradar (radar nowcast, 5 min)
+#
+#  RUNS ON BATTERY: wakes up, refreshes the screen and goes back to deep
+#  sleep. E-paper keeps the image without using any power.
+#    · Peak windows (12:30–13:30 and 17:30–18:30): every 10 min
+#    · Rest of the day (06:00–24:00): every 30 min
+#    · Night (00:00–06:00): sleeps straight through until 06:00
+#    · Battery below 20 %: at most every 30 min; below 15 % it shows a
+#      warning on screen so you charge it
+#    · AI/OK button: wake up and refresh now (also at night)
+#    · Hold UP while pressing AI (or press UP while awake): maintenance
+#      mode, stays awake with Wi-Fi on for OTA. DOWN: exit and sleep.
+#  Requires ESPHome 2026.7.0 or newer.
+# =====================================================================
+
+substitutions:
+  # Your location and timezone live in secrets.yaml (never committed)
+  latitude: !secret latitude
+  longitude: !secret longitude
+  timezone: !secret timezone
+  rain_threshold_mmh: "0.2"   # rain (mm/h) from which you should take an umbrella
+  interval_min: "30"          # wake-up interval outside peak windows (minutes)
+  peak_interval_min: "10"     # wake-up interval inside peak windows
+  # Peak windows as "start, end" in minutes since midnight (hour*60 + minutes)
+  peak1: "12*60+30, 13*60+30"   # 12:30 – 13:30
+  peak2: "17*60+30, 18*60+30"   # 17:30 – 18:30
+  battery_saver_pct: "20"     # below this %, update at most every 30 min
+  battery_warning_pct: "15"   # below this %, show a warning on screen
+  night_start_hour: "0"       # no updates from this hour… (0 = midnight, 23 = 23:00)
+  night_end_hour: "6"         # …until this hour (first update of the morning)
+
+esphome:
+  name: sticky-weather
+  friendly_name: Sticky Weather
+  min_version: 2026.7.0
+  includes:
+    - sticky_weather.h        # memory that survives deep sleep (trends, redraw)
+  on_boot:
+    # First of all: release the pins that were "frozen" during deep sleep,
+    # without ever letting the power drop (GPIO45/46 HIGH).
+    - priority: 1000
+      then:
+        - lambda: |-
+            for (int pin : {45, 46}) {
+              gpio_num_t p = (gpio_num_t) pin;
+              gpio_set_direction(p, GPIO_MODE_OUTPUT);
+              gpio_set_level(p, 1);
+            }
+            // Display on (GPIO47 = e-paper power, active HIGH)
+            gpio_set_direction(GPIO_NUM_47, GPIO_MODE_OUTPUT);
+            gpio_set_level(GPIO_NUM_47, 1);
+            gpio_deep_sleep_hold_dis();
+            for (int pin : {45, 46, 47, 4, 10, 38, 41, 42, 48}) gpio_hold_dis((gpio_num_t) pin);
+            // Touch, microphone, microSD and buzzer off: not used
+            for (int pin : {42, 38, 10, 48}) {
+              gpio_set_direction((gpio_num_t) pin, GPIO_MODE_OUTPUT);
+              gpio_set_level((gpio_num_t) pin, 0);
+            }
+    # If UP is held while waking up (with AI): maintenance mode from the
+    # start (Wi-Fi stays on and it doesn't go back to sleep)
+    - priority: 600
+      then:
+        - lambda: |-
+            gpio_set_direction(GPIO_NUM_5, GPIO_MODE_INPUT);
+            gpio_pullup_en(GPIO_NUM_5);
+            delay(5);
+            if (gpio_get_level(GPIO_NUM_5) == 0) {
+              id(maintenance) = true;
+              id(sleep_ctl).prevent_deep_sleep();
+              ESP_LOGI("maintenance", "UP held at boot: maintenance mode");
+            }
+    # Safety net: if it couldn't refresh within 60 s (e.g. no Wi-Fi),
+    # draw whatever it has (at least the indoor temperature) and sleep.
+    - priority: -100
+      then:
+        - delay: 60s
+        - if:
+            condition:
+              not:
+                script.is_running: refresh
+            then:
+              - script.execute: offline_refresh
+
+esp32:
+  variant: esp32s3
+  board: esp32-s3-devkitc-1
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+logger:
+  level: INFO
+  hardware_uart: UART0        # the Sticky's USB-C goes to a CH343P USB-UART (UART0)
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  fast_connect: true          # faster connection after wake-up = less battery
+  on_connect:
+    - script.execute: refresh
+
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: ${timezone}
+    servers:
+      - time.cloudflare.com
+      - time.google.com
+      - pool.ntp.org
+
+# ---------------------------------------------------------------------
+#  Power
+#  GPIO45 = power hold, GPIO46 = power lock (active HIGH)
+#  GPIO39 = battery charger enable (active LOW)
+# ---------------------------------------------------------------------
+switch:
+  - platform: gpio
+    id: power_hold
+    pin:
+      number: GPIO45
+      ignore_strapping_warning: true
+    restore_mode: ALWAYS_ON
+    internal: true
+  - platform: gpio
+    id: power_lock
+    pin:
+      number: GPIO46
+      ignore_strapping_warning: true
+    restore_mode: ALWAYS_ON
+    internal: true
+  - platform: gpio
+    id: charger
+    pin:
+      number: GPIO39
+      inverted: true
+    restore_mode: ALWAYS_ON
+    internal: true
+
+deep_sleep:
+  id: sleep_ctl
+  sleep_duration: ${interval_min}min
+  esp32_ext1_wakeup:
+    pins:
+      - GPIO4                 # AI/OK button
+    mode: ANY_LOW
+
+# ---------------------------------------------------------------------
+#  Buses
+# ---------------------------------------------------------------------
+i2c:
+  - id: sensor_bus
+    sda: GPIO1
+    scl:
+      number: GPIO0
+      ignore_strapping_warning: true
+    frequency: 400kHz
+
+spi:
+  clk_pin: GPIO13
+  mosi_pin: GPIO14
+
+# ---------------------------------------------------------------------
+#  State
+# ---------------------------------------------------------------------
+globals:
+  - id: rain_in_min         # minutes until rain in the next hour (-1 = dry)
+    type: int
+    initial_value: "-1"
+  - id: rain_start_time     # "HH:MM" when the rain starts
+    type: std::string
+    initial_value: '""'
+  - id: rain_max_mmh        # heaviest rain in the next hour (mm/h)
+    type: float
+    initial_value: "0"
+  - id: rain_ok             # do we have rain data?
+    type: bool
+    initial_value: "false"
+  - id: sleep_ms            # how long to sleep next
+    type: uint32_t
+    initial_value: "${interval_min} * 60 * 1000"
+  - id: rain_mmh            # forecast rain (mm/h) every 5 min, next 2 h
+    type: std::array<float, 24>
+  - id: rain_n              # number of 5-minute slots received
+    type: int
+    initial_value: "0"
+  - id: rain_first_slot_min # minutes since midnight of the first slot
+    type: int
+    initial_value: "0"
+  - id: rain_later_min      # minutes until rain in the 2nd hour (-1 = dry)
+    type: int
+    initial_value: "-1"
+  - id: weather_code        # Open-Meteo WMO code (fog, snow...)
+    type: int
+    initial_value: "-1"
+  - id: is_daytime
+    type: bool
+    initial_value: "true"
+  - id: night_sleep         # the next sleep lasts the whole night
+    type: bool
+    initial_value: "false"
+  - id: battery_low         # below ${battery_warning_pct} %: show a warning
+    type: bool
+    initial_value: "false"
+  - id: buienradar_ok       # did Buienradar answer during this wake-up?
+    type: bool
+    initial_value: "false"
+  - id: om_rain_mmh         # fallback: Open-Meteo rain every 15 min (mm/h)
+    type: std::array<float, 8>
+  - id: om_rain_n
+    type: int
+    initial_value: "0"
+  - id: om_first_slot_min   # minutes since midnight of the first 15-min slot
+    type: int
+    initial_value: "0"
+  - id: trend_indoor        # -1 falling / 0 steady / 1 rising (last hour)
+    type: int
+    initial_value: "0"
+  - id: trend_outdoor
+    type: int
+    initial_value: "0"
+  - id: redraw              # does the screen need refreshing?
+    type: bool
+    initial_value: "true"
+  - id: maintenance         # maintenance mode: don't sleep
+    type: bool
+    initial_value: "false"
+
+sensor:
+  - platform: sht4x
+    id: sht40
+    i2c_id: sensor_bus
+    address: 0x44
+    update_interval: never  # read on every wake-up from the script
+    temperature:
+      id: indoor_temp
+      name: "Indoor temperature"
+      # The sensor sits inside the case and can read a bit high.
+      # To calibrate it against another thermometer, uncomment and adjust:
+      # filters:
+      #   - offset: -1.5
+    humidity:
+      id: indoor_humidity
+      name: "Indoor humidity"
+
+  # BQ27220 battery fuel gauge (same I2C bus as the SHT40)
+  - platform: bq27220
+    id: battery
+    i2c_id: sensor_bus
+    update_interval: never   # read on every wake-up from the script
+    battery_level:
+      id: battery_pct
+      name: "Battery"
+    voltage:
+      id: battery_voltage
+      name: "Battery voltage"
+
+  - platform: template
+    id: outdoor_temp
+    name: "Outdoor temperature"
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    update_interval: never
+  - platform: template
+    id: feels_like
+    name: "Feels like"
+    unit_of_measurement: "°C"
+    update_interval: never
+  - platform: template
+    id: cloud_cover
+    name: "Cloud cover"
+    unit_of_measurement: "%"
+    update_interval: never
+  - platform: template
+    id: wind_speed
+    name: "Wind speed"
+    unit_of_measurement: "km/h"
+    update_interval: never
+  - platform: template
+    id: wind_gusts
+    name: "Wind gusts"
+    unit_of_measurement: "km/h"
+    update_interval: never
+  - platform: template
+    id: today_min
+    name: "Today's minimum"
+    unit_of_measurement: "°C"
+    update_interval: never
+  - platform: template
+    id: today_max
+    name: "Today's maximum"
+    unit_of_measurement: "°C"
+    update_interval: never
+
+binary_sensor:
+  # Plugged into USB? (GPIO9 HIGH = external power)
+  - platform: gpio
+    id: usb_power
+    pin: GPIO9
+    internal: true
+  # UP: maintenance mode (stay awake)
+  - platform: gpio
+    id: button_up
+    pin:
+      number: GPIO5
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    filters:
+      - delayed_on: 30ms
+    on_press:
+      - globals.set:
+          id: maintenance
+          value: "true"
+      - deep_sleep.prevent: sleep_ctl
+      - wifi.enable:
+      - logger.log: "Maintenance mode: staying awake"
+      - component.update: epaper
+  # DOWN: leave maintenance mode and go to sleep
+  - platform: gpio
+    id: button_down
+    pin:
+      number: GPIO6
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    filters:
+      - delayed_on: 30ms
+    on_press:
+      - if:
+          condition:
+            lambda: "return id(maintenance);"
+          then:
+            - globals.set:
+                id: maintenance
+                value: "false"
+            - deep_sleep.allow: sleep_ctl
+            - script.execute: refresh
+
+http_request:
+  timeout: 10s
+
+script:
+  - id: refresh
+    mode: single
+    then:
+      - lambda: "id(buienradar_ok) = false; id(om_rain_n) = 0;"
+      - component.update: sht40
+      - component.update: battery
+      # --- Outdoor weather (Open-Meteo) ---
+      - http_request.get:
+          url: "http://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&current=temperature_2m,apparent_temperature,cloud_cover,wind_speed_10m,wind_gusts_10m,weather_code,is_day&daily=temperature_2m_min,temperature_2m_max&forecast_days=1&minutely_15=precipitation&forecast_minutely_15=8&wind_speed_unit=kmh&timezone=auto"
+          capture_response: true
+          max_response_buffer_size: 4096
+          collect_headers:
+            - date
+          on_response:
+            then:
+              # Clock fallback: if NTP hasn't answered, use the response's
+              # "Date: Sun, 22 Nov 2026 16:20:34 GMT" header
+              - lambda: |-
+                  if (id(sntp_time).now().is_valid()) return;
+                  std::string d = response->get_response_header("date");
+                  int day, year, h, m, s; char mon[4] = {0};
+                  if (sscanf(d.c_str(), "%*3s, %d %3s %d %d:%d:%d", &day, mon, &year, &h, &m, &s) != 6) {
+                    ESP_LOGW("clock", "Invalid Date header: '%s'", d.c_str());
+                    return;
+                  }
+                  const char *months = "JanFebMarAprMayJunJulAugSepOctNovDec";
+                  const char *pm = strstr(months, mon);
+                  if (pm == nullptr) return;
+                  int mo = (pm - months) / 3 + 1;
+                  // Days since 1970-01-01 (Howard Hinnant's algorithm)
+                  int y = year - (mo <= 2);
+                  int era = y / 400;
+                  int yoe = y - era * 400;
+                  int doy = (153 * (mo + (mo > 2 ? -3 : 9)) + 2) / 5 + day - 1;
+                  int doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+                  long days = (long) era * 146097 + doe - 719468;
+                  struct timeval tv = { (time_t) (days * 86400L + h * 3600 + m * 60 + s), 0 };
+                  settimeofday(&tv, nullptr);
+                  ESP_LOGI("clock", "Clock set from Date header: %s", d.c_str());
+              - lambda: |-
+                  if (response->status_code != 200) {
+                    ESP_LOGW("weather", "Open-Meteo HTTP %d", response->status_code);
+                    return;
+                  }
+                  json::parse_json(body, [](JsonObject root) -> bool {
+                    JsonObject c = root["current"];
+                    if (c.isNull() || c["temperature_2m"].isNull()) return false;
+                    id(outdoor_temp).publish_state(c["temperature_2m"].as<float>());
+                    if (!c["apparent_temperature"].isNull()) id(feels_like).publish_state(c["apparent_temperature"].as<float>());
+                    if (!c["cloud_cover"].isNull())          id(cloud_cover).publish_state(c["cloud_cover"].as<float>());
+                    if (!c["wind_speed_10m"].isNull())       id(wind_speed).publish_state(c["wind_speed_10m"].as<float>());
+                    if (!c["wind_gusts_10m"].isNull())       id(wind_gusts).publish_state(c["wind_gusts_10m"].as<float>());
+                    if (!c["weather_code"].isNull())         id(weather_code) = c["weather_code"].as<int>();
+                    if (!c["is_day"].isNull())               id(is_daytime) = c["is_day"].as<int>() == 1;
+                    JsonVariant mn = root["daily"]["temperature_2m_min"][0];
+                    JsonVariant mx = root["daily"]["temperature_2m_max"][0];
+                    if (!mn.isNull()) id(today_min).publish_state(mn.as<float>());
+                    if (!mx.isNull()) id(today_max).publish_state(mx.as<float>());
+                    // Rain fallback: mm per 15 min -> mm/h
+                    JsonArray pr = root["minutely_15"]["precipitation"];
+                    const char *t0 = root["minutely_15"]["time"][0] | "";
+                    int n = 0;
+                    for (JsonVariant v : pr) { if (n >= 8) break; id(om_rain_mmh)[n++] = v.as<float>() * 4.0f; }
+                    id(om_rain_n) = n;
+                    if (strlen(t0) >= 16) id(om_first_slot_min) = atoi(t0 + 11) * 60 + atoi(t0 + 14);
+                    return true;
+                  });
+      # --- Rain in the next 2 hours (Buienradar, "VALUE|HH:MM" lines every 5 min) ---
+      - http_request.get:
+          url: "https://gpsgadget.buienradar.nl/data/raintext?lat=${latitude}&lon=${longitude}"
+          capture_response: true
+          max_response_buffer_size: 1024
+          on_response:
+            then:
+              - lambda: |-
+                  if (response->status_code != 200) {
+                    ESP_LOGW("rain", "Buienradar HTTP %d", response->status_code);
+                    return;
+                  }
+                  int idx = 0;
+                  size_t pos = 0;
+                  while (pos < body.size() && idx < 24) {   // 24 x 5 min = 2 hours
+                    size_t end = body.find('\n', pos);
+                    if (end == std::string::npos) end = body.size();
+                    std::string line = body.substr(pos, end - pos);
+                    pos = end + 1;
+                    size_t bar = line.find('|');
+                    if (bar == std::string::npos) continue;
+                    int value = atoi(line.substr(0, bar).c_str());
+                    // Buienradar formula: mm/h = 10^((value-109)/32); 0 = dry
+                    float mmh = value > 0 ? powf(10.0f, (value - 109) / 32.0f) : 0.0f;
+                    if (idx == 0) {
+                      int hh = 0, mm = 0;
+                      sscanf(line.c_str() + bar + 1, "%d:%d", &hh, &mm);
+                      id(rain_first_slot_min) = hh * 60 + mm;
+                    }
+                    id(rain_mmh)[idx++] = mmh;
+                  }
+                  if (idx == 0) return;
+                  id(rain_n) = idx;
+                  id(buienradar_ok) = true;
+      # --- Rain summary (Buienradar or, if it failed, Open-Meteo) ---
+      - lambda: |-
+          if (!id(buienradar_ok)) {
+            if (id(om_rain_n) == 0) { ESP_LOGW("rain", "No rain data"); return; }
+            // Each 15-min Open-Meteo slot = three 5-min slots
+            int n = std::min(24, id(om_rain_n) * 3);
+            for (int i = 0; i < n; i++) id(rain_mmh)[i] = id(om_rain_mmh)[i / 3];
+            id(rain_n) = n;
+            id(rain_first_slot_min) = id(om_first_slot_min);
+            ESP_LOGW("rain", "Buienradar didn't answer: using Open-Meteo");
+          }
+          int first = -1, later = -1;
+          float max_mmh = 0;
+          for (int i = 0; i < id(rain_n); i++) {
+            float mmh = id(rain_mmh)[i];
+            if (i < 12) {                                    // the decision: next hour
+              if (mmh >= ${rain_threshold_mmh} && first < 0) first = i;
+              max_mmh = std::max(max_mmh, mmh);
+            } else if (mmh >= ${rain_threshold_mmh} && later < 0) {
+              later = i;
+            }
+          }
+          id(rain_in_min) = first < 0 ? -1 : first * 5;
+          id(rain_later_min) = later < 0 ? -1 : later * 5;
+          id(rain_max_mmh) = max_mmh;
+          if (first >= 0) {
+            int m = id(rain_first_slot_min) + first * 5;
+            char hh[8];
+            snprintf(hh, sizeof(hh), "%02d:%02d", (m / 60) % 24, m % 60);
+            id(rain_start_time) = hh;
+          } else {
+            id(rain_start_time) = "";
+          }
+          id(rain_ok) = true;
+          ESP_LOGI("rain", "Rain in %d min (%s), max %.2f mm/h",
+                   id(rain_in_min), id(rain_start_time).c_str(), max_mmh);
+      # Wait (max 15 s) for the clock: needed for the "updated at" time
+      # and to know whether it's time to sleep through the night
+      - wait_until:
+          condition:
+            lambda: "return id(sntp_time).now().is_valid();"
+          timeout: 15s
+      - script.execute: compute_sleep
+      - script.execute: prepare_display
+      # All data is in: turn Wi-Fi off (the biggest power draw) while drawing
+      - if:
+          condition:
+            lambda: "return !id(maintenance);"
+          then:
+            - wifi.disable:
+      - if:
+          condition:
+            lambda: "return id(redraw);"
+          then:
+            - component.update: epaper
+            - delay: 4s         # the e-paper refresh takes ~2.9 s
+      - script.execute: go_to_sleep
+
+  - id: offline_refresh
+    mode: single
+    then:
+      - logger.log: "No Wi-Fi: drawing what I have and going to sleep"
+      - component.update: sht40
+      - component.update: battery
+      - delay: 1s
+      - script.execute: compute_sleep
+      - script.execute: prepare_display
+      - if:
+          condition:
+            lambda: "return id(redraw);"
+          then:
+            - component.update: epaper
+            - delay: 4s
+      - script.execute: go_to_sleep
+
+  # How long to sleep? Depends on peak windows, night and battery
+  - id: compute_sleep
+    mode: single
+    then:
+      - lambda: |-
+          const int DAY = 86400;
+          int normal_interval = ${interval_min}, peak_interval = ${peak_interval_min};
+          float b = id(battery_pct).has_state() ? id(battery_pct).state : NAN;
+          bool charging = id(usb_power).state;
+          bool saver = !std::isnan(b) && b < ${battery_saver_pct} && !charging;
+          id(battery_low) = !std::isnan(b) && b < ${battery_warning_pct} && !charging;
+          id(night_sleep) = false;
+          auto t = id(sntp_time).now();
+          if (!t.is_valid()) {
+            id(sleep_ms) = (uint32_t) (saver ? 30 : normal_interval) * 60 * 1000;
+            return;
+          }
+          int now = t.hour * 3600 + t.minute * 60 + t.second;
+          const int peaks[][2] = { {${peak1}}, {${peak2}} };   // in minutes
+          bool in_peak = false;
+          for (auto &p : peaks)
+            if (now >= p[0] * 60 && now < p[1] * 60) in_peak = true;
+          int interval = in_peak ? peak_interval : normal_interval;
+          if (saver) interval = std::max(interval, 30);
+          int next = now + interval * 60;
+          // Don't miss the start of a peak window: wake up right when it begins
+          if (!saver)
+            for (auto &p : peaks)
+              if (now < p[0] * 60 && next > p[0] * 60) next = p[0] * 60;
+          int night_start = ${night_start_hour} * 3600, night_end = ${night_end_hour} * 3600;
+          auto is_night = [&](int s) {
+            return night_start < night_end ? (s >= night_start && s < night_end)
+                                           : (s >= night_start || s < night_end);
+          };
+          if (is_night(now) || is_night(next % DAY)) {
+            id(sleep_ms) = (uint32_t) ((night_end - now + DAY) % DAY) * 1000;
+            id(night_sleep) = true;
+          } else {
+            id(sleep_ms) = (uint32_t) (next - now) * 1000;
+          }
+          ESP_LOGI("sleep", "Next update in %u min%s%s", (unsigned) (id(sleep_ms) / 60000),
+                   in_peak ? " (peak window)" : "", saver ? " (battery saver)" : "");
+
+  # Trends (last hour) and decide whether the screen needs redrawing
+  - id: prepare_display
+    mode: single
+    then:
+      - lambda: |-
+          auto &st = rtc_state();
+          bool clock_ok = id(sntp_time).now().is_valid();
+          time_t now = ::time(nullptr);
+          float ti = id(indoor_temp).has_state() ? id(indoor_temp).state : NAN;
+          float to = id(outdoor_temp).has_state() ? id(outdoor_temp).state : NAN;
+          auto trend = [](float v, float ref) -> int {
+            if (std::isnan(v) || std::isnan(ref)) return 0;
+            float d = v - ref;
+            return d >= 0.3f ? 1 : d <= -0.3f ? -1 : 0;
+          };
+          if (clock_ok) {
+            if (st.ref_time == 0 || now < st.ref_time || now - st.ref_time > 3 * 3600) {
+              // No reference or too old (e.g. after the night): start over
+              st.ref_indoor = ti; st.ref_outdoor = to; st.ref_time = now;
+              st.trend_indoor = 0; st.trend_outdoor = 0;
+            } else if (now - st.ref_time >= 58 * 60) {
+              // About an hour has passed: compute the trend and renew the reference
+              st.trend_indoor = trend(ti, st.ref_indoor);
+              st.trend_outdoor = trend(to, st.ref_outdoor);
+              st.ref_indoor = ti; st.ref_outdoor = to; st.ref_time = now;
+            }
+          }
+          id(trend_indoor) = st.trend_indoor;
+          id(trend_outdoor) = st.trend_outdoor;
+
+          // Signature of everything shown on screen (except the time)
+          char f[200];
+          float b = id(battery_pct).has_state() ? id(battery_pct).state : -1;
+          snprintf(f, sizeof(f), "%.1f|%.0f|%.1f|%.0f|%.0f|%d|%d|%.0f|%.0f|%.0f|%d|%d|%.1f|%s|%d|%d|%d|%d|%d|%d|%d|%d|",
+                   ti, id(indoor_humidity).state, to, id(feels_like).state, id(cloud_cover).state / 10.0f,
+                   id(weather_code), (int) id(is_daytime), id(wind_speed).state,
+                   id(today_min).state, id(today_max).state, id(rain_in_min), id(rain_later_min),
+                   id(rain_max_mmh), id(rain_start_time).c_str(), (int) (b / 10), (int) id(usb_power).state,
+                   (int) id(maintenance), (int) id(night_sleep), (int) id(battery_low), (int) id(rain_ok),
+                   id(trend_indoor), id(trend_outdoor));
+          std::string signature = f;
+          for (int i = 0; i < id(rain_n); i++)      // bar heights of the rain chart
+            signature += (char) ('A' + (int) (20 * std::min(1.0f, sqrtf(id(rain_mmh)[i] / 5.0f))));
+          uint32_t h = fnv1a(signature);
+          bool stale = !clock_ok || st.drawn_time == 0 || now - st.drawn_time >= 55 * 60;
+          id(redraw) = id(maintenance) || stale || h != st.signature;
+          if (id(redraw)) {
+            st.signature = h;
+            if (clock_ok) st.drawn_time = now;
+          }
+          ESP_LOGI("display", "%s", id(redraw) ? "Redrawing" : "Nothing changed: skipping redraw");
+
+  - id: go_to_sleep
+    mode: single
+    then:
+      - if:
+          condition:
+            lambda: "return id(maintenance);"
+          then:
+            - logger.log: "Maintenance mode active: staying awake"
+          else:
+            # Freeze the pins during deep sleep: power kept on, peripherals
+            # (touch, mic, SD, buzzer) off, wake-up button with pull-up.
+            - lambda: |-
+                auto hold = [](int pin, int level) {
+                  gpio_num_t p = (gpio_num_t) pin;
+                  gpio_hold_dis(p);
+                  gpio_set_direction(p, GPIO_MODE_OUTPUT);
+                  gpio_set_level(p, level);
+                  gpio_hold_en(p);
+                };
+                hold(45, 1); hold(46, 1);                   // keep power on
+                hold(47, 0);                                // e-paper unpowered (keeps the image)
+                hold(42, 0); hold(41, 0);                   // touch off
+                hold(38, 0);                                // microphone off
+                hold(10, 0);                                // microSD off
+                hold(48, 0);                                // buzzer off
+                gpio_num_t b = GPIO_NUM_4;                  // AI/OK button wakes it up
+                gpio_hold_dis(b);
+                gpio_set_direction(b, GPIO_MODE_INPUT);
+                gpio_pullup_en(b);
+                gpio_hold_en(b);
+                gpio_deep_sleep_hold_en();
+            - deep_sleep.enter:
+                id: sleep_ctl
+                sleep_duration: !lambda "return id(sleep_ms);"
+
+# ---------------------------------------------------------------------
+#  800x480 display (black & white e-paper).
+#  NOTE: always pass a color when drawing.
+# ---------------------------------------------------------------------
+font:
+  # --- Text (Roboto) ---
+  - file: { type: gfonts, family: Roboto, weight: 700 }
+    id: f_big             # integer part of the temperature
+    size: 100
+    glyphs: ["0123456789-"]
+  - file: { type: gfonts, family: Roboto, weight: 700 }
+    id: f_decimal         # temperature decimals
+    size: 44
+    glyphs: [".0123456789-"]
+  - file: { type: gfonts, family: Roboto }
+    id: f_unit            # °C
+    size: 30
+    glyphs: ["°C"]
+  - file: { type: gfonts, family: Roboto, weight: 700 }
+    id: f_alert
+    size: 38
+    glyphsets: [GF_Latin_Core]
+  - file: { type: gfonts, family: Roboto, weight: 700 }
+    id: f_title
+    size: 22
+    glyphsets: [GF_Latin_Core]
+  - file: { type: gfonts, family: Roboto }
+    id: f_medium
+    size: 28
+    glyphsets: [GF_Latin_Core]
+    glyphs: ["°", "%", "·"]
+  - file: { type: gfonts, family: Roboto }
+    id: f_list
+    size: 23
+    glyphsets: [GF_Latin_Core]
+    glyphs: ["°", "·"]
+  - file: { type: gfonts, family: Roboto }
+    id: f_legend          # small button legend
+    size: 17
+    glyphsets: [GF_Latin_Core]
+    glyphs: ["·"]
+  - file: { type: gfonts, family: Roboto }
+    id: f_small
+    size: 20
+    glyphsets: [GF_Latin_Core]
+    glyphs: ["·"]
+  # --- Icons (Material Design Icons v7.4.47, Apache 2.0; downloaded at build time) ---
+  - file: { type: web, url: "https://raw.githubusercontent.com/Templarian/MaterialDesign-Webfont/v7.4.47/fonts/materialdesignicons-webfont.ttf" }
+    id: i_title
+    size: 28
+    glyphs:
+      - "\U000F0F54"   # home-thermometer
+      - "\U000F0597"   # weather-rainy
+      - "\U000F0599"   # weather-sunny
+      - "\U000F0594"   # weather-night
+      - "\U000F0595"   # weather-partly-cloudy
+      - "\U000F0F31"   # weather-night-partly-cloudy
+      - "\U000F0590"   # weather-cloudy
+      - "\U000F0591"   # weather-fog
+      - "\U000F0598"   # weather-snowy
+  - file: { type: web, url: "https://raw.githubusercontent.com/Templarian/MaterialDesign-Webfont/v7.4.47/fonts/materialdesignicons-webfont.ttf" }
+    id: i_medium
+    size: 30
+    glyphs:
+      - "\U000F058E"   # water-percent
+  - file: { type: web, url: "https://raw.githubusercontent.com/Templarian/MaterialDesign-Webfont/v7.4.47/fonts/materialdesignicons-webfont.ttf" }
+    id: i_list
+    size: 28
+    glyphs:
+      - "\U000F0599"   # weather-sunny
+      - "\U000F0594"   # weather-night
+      - "\U000F0595"   # weather-partly-cloudy
+      - "\U000F0F31"   # weather-night-partly-cloudy
+      - "\U000F0590"   # weather-cloudy
+      - "\U000F0591"   # weather-fog
+      - "\U000F0598"   # weather-snowy
+      - "\U000F059D"   # weather-windy
+      - "\U000F050F"   # thermometer
+  - file: { type: web, url: "https://raw.githubusercontent.com/Templarian/MaterialDesign-Webfont/v7.4.47/fonts/materialdesignicons-webfont.ttf" }
+    id: i_large
+    size: 46
+    glyphs:
+      - "\U000F054A"   # umbrella
+      - "\U000F09B0"   # umbrella-closed
+  - file: { type: web, url: "https://raw.githubusercontent.com/Templarian/MaterialDesign-Webfont/v7.4.47/fonts/materialdesignicons-webfont.ttf" }
+    id: i_small
+    size: 22
+    glyphs:
+      - "\U000F0150"   # clock-outline
+      - "\U000F0594"   # weather-night
+      - "\U000F008E"   # battery-outline
+      - "\U000F007B"   # battery-20
+      - "\U000F007D"   # battery-40
+      - "\U000F007F"   # battery-60
+      - "\U000F0081"   # battery-80
+      - "\U000F0079"   # battery
+      - "\U000F0084"   # battery-charging
+      - "\U000F0045"   # arrow-down (minimum)
+      - "\U000F005D"   # arrow-up (maximum)
+      - "\U000F0535"   # trending-up (trend)
+      - "\U000F0533"   # trending-down (trend)
+      - "\U000F10CD"   # battery-alert-variant-outline
+
+display:
+  - platform: epaper_spi
+    id: epaper
+    model: Seeed-reTerminal-Sticky
+    update_interval: never          # redrawn from the script on each wake-up
+    lambda: |-
+      auto INK = Color::BLACK;
+      auto PAPER = Color::WHITE;
+      int bx, by, w, h;   // for measuring text
+
+      // ===== Drawing helpers =====
+      // Filled rectangle with rounded corners
+      auto rrect = [&](int x, int y, int w, int h, int r, Color c) {
+        it.filled_rectangle(x + r, y, w - 2 * r, h, c);
+        it.filled_rectangle(x, y + r, w, h - 2 * r, c);
+        it.filled_circle(x + r, y + r, r, c);
+        it.filled_circle(x + w - r - 1, y + r, r, c);
+        it.filled_circle(x + r, y + h - r - 1, r, c);
+        it.filled_circle(x + w - r - 1, y + h - r - 1, r, c);
+      };
+      // Outlined box (3 px border)
+      auto box = [&](int x, int y, int w, int h, int r) {
+        rrect(x, y, w, h, r, INK);
+        rrect(x + 3, y + 3, w - 6, h - 6, r - 3, PAPER);
+      };
+      auto text_width = [&](const char *s, esphome::font::Font *f) {
+        it.get_text_bounds(0, 0, s, f, TextAlign::TOP_LEFT, &bx, &by, &w, &h);
+        return w;
+      };
+      // Icon + text, centered together at (cx, cy)
+      auto icon_text = [&](int cx, int cy, esphome::font::Font *fi, const char *icon,
+                           esphome::font::Font *ft, const char *txt) {
+        int wi = text_width(icon, fi), wt = text_width(txt, ft), gap = 10;
+        int x = cx - (wi + gap + wt) / 2;
+        it.print(x, cy, fi, INK, TextAlign::CENTER_LEFT, icon);
+        it.print(x + wi + gap, cy, ft, INK, TextAlign::CENTER_LEFT, txt);
+      };
+      // Card with a black header: white icon + title
+      auto card = [&](int x, int y, int w, int h, const char *icon, const char *title) {
+        rrect(x, y, w, h, 14, INK);
+        rrect(x + 3, y + 42, w - 6, h - 45, 11, PAPER);
+        it.filled_rectangle(x + 3, y + 42, w - 6, 12, PAPER);   // straight join under the header
+        it.print(x + 14, y + 22, id(i_title), PAPER, TextAlign::CENTER_LEFT, icon);
+        it.print(x + 50, y + 22, id(f_title), PAPER, TextAlign::CENTER_LEFT, title);
+      };
+      // Formatted temperature: big "21", small ".4" below and "°C" above
+      auto temperature = [&](int cx, int base, sensor::Sensor *s, int trend) {
+        if (!s->has_state() || std::isnan(s->state)) {
+          it.print(cx, base, id(f_big), INK, TextAlign::BASELINE_CENTER, "--");
+          return;
+        }
+        char buf[12];
+        snprintf(buf, sizeof(buf), "%.1f", s->state);
+        char *dot = strchr(buf, '.');
+        std::string integer = dot ? std::string(buf, dot - buf) : std::string(buf);
+        std::string decimal = dot ? std::string(dot) : "";
+        int w1 = text_width(integer.c_str(), id(f_big));
+        int w2 = std::max(text_width(decimal.c_str(), id(f_decimal)), text_width("°C", id(f_unit)));
+        int x = cx - (w1 + 6 + w2) / 2;
+        it.print(x, base, id(f_big), INK, TextAlign::BASELINE_LEFT, integer.c_str());
+        it.print(x + w1 + 6, base, id(f_decimal), INK, TextAlign::BASELINE_LEFT, decimal.c_str());
+        it.print(x + w1 + 8, base - 72, id(f_unit), INK, TextAlign::TOP_LEFT, "°C");
+        // Trend arrow (last hour) next to °C
+        if (trend != 0)
+          it.print(x + w1 + 8 + text_width("°C", id(f_unit)) + 6, base - 68, id(i_small), INK,
+                   TextAlign::TOP_LEFT, trend > 0 ? "\U000F0535" : "\U000F0533");
+      };
+
+      bool rain_soon = id(rain_ok) && id(rain_in_min) >= 0;
+
+      // Sky: icon + text
+      const char *sky_icon = "\U000F0595";
+      const char *sky_text = "--";
+      if (id(cloud_cover).has_state()) {
+        int code = id(weather_code);
+        float n = id(cloud_cover).state;
+        bool day = id(is_daytime);
+        if (code == 45 || code == 48)                            { sky_icon = "\U000F0591"; sky_text = "Foggy"; }
+        else if ((code >= 71 && code <= 77) || code == 85 || code == 86) { sky_icon = "\U000F0598"; sky_text = "Snow"; }
+        else if (n < 20)  { sky_icon = day ? "\U000F0599" : "\U000F0594"; sky_text = "Clear sky"; }
+        else if (n < 60)  { sky_icon = day ? "\U000F0595" : "\U000F0F31"; sky_text = "Partly cloudy"; }
+        else if (n < 90)  { sky_icon = "\U000F0590"; sky_text = "Cloudy"; }
+        else              { sky_icon = "\U000F0590"; sky_text = "Overcast"; }
+      }
+      // Wind: word + km/h
+      char wind_text[32] = "--";
+      if (id(wind_speed).has_state()) {
+        float v = id(wind_speed).state;
+        const char *word = v < 6 ? "Calm" : v < 20 ? "Breezy" : v < 39 ? "Windy" : v < 62 ? "Very windy" : "Storm";
+        snprintf(wind_text, sizeof(wind_text), "%s %.0f km/h", word, v);
+      }
+
+      // ---------- HOME ----------
+      card(10, 10, 250, 235, "\U000F0F54", "HOME");
+      temperature(135, 160, id(indoor_temp), id(trend_indoor));
+      if (id(indoor_humidity).has_state()) {
+        char hum[16];
+        snprintf(hum, sizeof(hum), "%.0f%%", id(indoor_humidity).state);
+        icon_text(135, 210, id(i_medium), "\U000F058E", id(f_medium), hum);
+      }
+
+      // ---------- OUTSIDE ----------
+      card(270, 10, 520, 235, rain_soon ? "\U000F0597" : sky_icon, "OUTSIDE");
+      // Left: temperature and feels-like (aligned with HOME)
+      temperature(395, 160, id(outdoor_temp), id(trend_outdoor));
+      if (id(feels_like).has_state())
+        it.printf(395, 210, id(f_medium), INK, TextAlign::CENTER, "Feels like %.0f°", id(feels_like).state);
+      // Divider
+      it.filled_rectangle(520, 66, 2, 160, INK);
+      // Right: sky, wind and today's min/max
+      {
+        const int xi = 534, xt = 572;
+        const int row[3] = {88, 142, 196};
+        it.print(xi, row[0], id(i_list), INK, TextAlign::CENTER_LEFT, sky_icon);
+        it.print(xt, row[0], id(f_list), INK, TextAlign::CENTER_LEFT, sky_text);
+        it.print(xi, row[1], id(i_list), INK, TextAlign::CENTER_LEFT, "\U000F059D");
+        it.print(xt, row[1], id(f_list), INK, TextAlign::CENTER_LEFT, wind_text);
+        it.print(xi, row[2], id(i_list), INK, TextAlign::CENTER_LEFT, "\U000F050F");
+        int x = xt;
+        char v[12];
+        it.print(x, row[2], id(i_small), INK, TextAlign::CENTER_LEFT, "\U000F0045");
+        x += text_width("\U000F0045", id(i_small)) + 2;
+        if (id(today_min).has_state()) snprintf(v, sizeof(v), "%.0f°", id(today_min).state); else strcpy(v, "--");
+        it.print(x, row[2], id(f_list), INK, TextAlign::CENTER_LEFT, v);
+        x += text_width(v, id(f_list)) + 18;
+        it.print(x, row[2], id(i_small), INK, TextAlign::CENTER_LEFT, "\U000F005D");
+        x += text_width("\U000F005D", id(i_small)) + 2;
+        if (id(today_max).has_state()) snprintf(v, sizeof(v), "%.0f°", id(today_max).state); else strcpy(v, "--");
+        it.print(x, row[2], id(f_list), INK, TextAlign::CENTER_LEFT, v);
+      }
+
+      // ---------- RAIN: umbrella advice + 2-hour chart ----------
+      {
+        const int X = 10, Y = 255, W = 780, H = 170;
+        Color fg = rain_soon ? PAPER : INK;   // white on black when rain is coming
+        if (rain_soon) rrect(X, Y, W, H, 14, INK); else box(X, Y, W, H, 14);
+
+        if (!id(rain_ok)) {
+          it.print(400, Y + H / 2, id(f_medium), INK, TextAlign::CENTER, "No rain data (check Wi-Fi)");
+        } else {
+          // Row 1: icon + message on the left, details on the right
+          const int fy = Y + 32;
+          const char *umbrella = rain_soon ? "\U000F054A" : "\U000F09B0";
+          int wi = text_width(umbrella, id(i_large));
+          it.print(X + 20, fy, id(i_large), fg, TextAlign::CENTER_LEFT, umbrella);
+          it.print(X + 30 + wi, fy, id(f_alert), fg, TextAlign::CENTER_LEFT,
+                   rain_soon ? "TAKE AN UMBRELLA!" : "No umbrella needed");
+          char detail[48];
+          if (rain_soon && id(rain_in_min) == 0)
+            snprintf(detail, sizeof(detail), "Raining now · max %.1f mm/h", id(rain_max_mmh));
+          else if (rain_soon)
+            snprintf(detail, sizeof(detail), "From %s · max %.1f mm/h", id(rain_start_time).c_str(), id(rain_max_mmh));
+          else if (id(rain_later_min) >= 0) {
+            int m = id(rain_first_slot_min) + id(rain_later_min);
+            float max2 = 0;
+            for (int i = 12; i < id(rain_n) && i < 24; i++) max2 = std::max(max2, id(rain_mmh)[i]);
+            const char *kind = max2 < 1.0f ? "Light rain" : max2 < 4.0f ? "Rain" : "Heavy rain";
+            snprintf(detail, sizeof(detail), "%s ~%02d:%02d", kind, (m / 60) % 24, m % 60);
+          } else
+            snprintf(detail, sizeof(detail), "Dry for 2 hours");
+          it.print(X + W - 20, fy, id(f_list), fg, TextAlign::CENTER_RIGHT, detail);
+
+          // Chart: 24 bars of 5 min. Square-root scale so drizzle is visible
+          // and a downpour doesn't overflow (capped at 5 mm/h).
+          const int gx = X + 20, gw = W - 40, base = Y + 132, gh = 62;
+          int n = std::max(1, id(rain_n));
+          float step = (float) gw / 24;
+          for (int i = 0; i < n && i < 24; i++) {
+            float mmh = id(rain_mmh)[i];
+            int hb = (int) (gh * std::min(1.0f, sqrtf(mmh / 5.0f)));
+            if (mmh > 0 && hb < 3) hb = 3;
+            int bx0 = gx + (int) (i * step) + 2, bw = (int) step - 4;
+            // Next hour (decides the umbrella): filled bars.
+            // Second hour: hollow bars (outline only).
+            if (hb > 0) {
+              if (i < 12) it.filled_rectangle(bx0, base - hb, bw, hb, fg);
+              else {
+                it.rectangle(bx0, base - hb, bw, hb, fg);
+                if (bw > 4 && hb > 4) it.rectangle(bx0 + 1, base - hb + 1, bw - 2, hb - 2, fg);
+              }
+            }
+          }
+          it.filled_rectangle(gx, base, gw, 2, fg);                  // axis
+          // Time labels every 30 min
+          for (int k = 0; k <= 4; k++) {
+            int m = id(rain_first_slot_min) + k * 30;
+            char label[8];
+            if (k == 0) strcpy(label, "now");
+            else snprintf(label, sizeof(label), "%02d:%02d", (m / 60) % 24, m % 60);
+            int lx = gx + (int) (k * 6 * step);
+            TextAlign al = k == 0 ? TextAlign::TOP_LEFT : k == 4 ? TextAlign::TOP_RIGHT : TextAlign::TOP_CENTER;
+            it.print(k == 4 ? gx + gw : lx, base + 5, id(f_small), fg, al, label);
+          }
+        }
+      }
+
+      // ---------- Button LEGEND (small, bottom left) ----------
+      const int y0 = 435, bar_h = 38, cy = y0 + bar_h / 2;
+      auto legend = [&](bool draw) -> int {
+        int x = 22;
+        auto text = [&](const char *s) {
+          if (draw) it.print(x, cy, id(f_legend), INK, TextAlign::CENTER_LEFT, s);
+          x += text_width(s, id(f_legend));
+        };
+        auto triangle = [&](bool up) {   // Roboto has no arrows: draw them
+          if (draw) {
+            if (up) it.filled_triangle(x, cy + 5, x + 11, cy + 5, x + 5, cy - 6, INK);
+            else    it.filled_triangle(x, cy - 5, x + 11, cy - 5, x + 5, cy + 6, INK);
+          }
+          x += 16;
+        };
+        if (id(maintenance)) {
+          text("MAINTENANCE  ·  ");
+          triangle(false);
+          text("exit and sleep");
+        } else {
+          if (draw) {
+            rrect(x, cy - 10, 26, 20, 4, INK);   // "AI" inverted, like the button
+            it.print(x + 13, cy, id(f_legend), PAPER, TextAlign::CENTER, "AI");
+          }
+          x += 32;
+          text("refresh");
+          x += 16;
+          triangle(true);
+          text("maintenance");
+          x += 16;
+          triangle(false);
+          text("sleep");
+        }
+        return x;
+      };
+      if (id(battery_low) && !id(maintenance)) {
+        // Low battery: a clearly visible (black) warning instead of the legend
+        const char *msg = "Battery low · please charge";
+        int wi = text_width("\U000F10CD", id(i_small)), wt = text_width(msg, id(f_small));
+        rrect(10, y0, wi + 8 + wt + 28, bar_h, 10, INK);
+        it.print(24, cy, id(i_small), PAPER, TextAlign::CENTER_LEFT, "\U000F10CD");
+        it.print(24 + wi + 8, cy, id(f_small), PAPER, TextAlign::CENTER_LEFT, msg);
+      } else {
+        int end = legend(false);
+        box(10, y0, end - 10 + 12, bar_h, 10);
+        legend(true);
+      }
+
+      // ---------- BATTERY + TIME (bottom right) ----------
+      {
+        char footer[48] = "";
+        auto t = id(sntp_time).now();
+        bool whole_night = id(night_sleep);   // will sleep through the night
+        if (t.is_valid()) {
+          if (whole_night)
+            snprintf(footer, sizeof(footer), "%02d:%02d · next %02d:00", t.hour, t.minute, ${night_end_hour});
+          else
+            snprintf(footer, sizeof(footer), "%02d:%02d", t.hour, t.minute);
+        }
+        const char *clock_icon = whole_night ? "\U000F0594" : "\U000F0150";   // moon / clock
+        // Battery: icon by level, or a bolt while charging
+        char bat[8] = "";
+        const char *bat_icon = nullptr;
+        if (id(battery_pct).has_state() && !std::isnan(id(battery_pct).state)) {
+          float b = id(battery_pct).state;
+          snprintf(bat, sizeof(bat), "%.0f%%", b);
+          if (id(usb_power).state) bat_icon = "\U000F0084";
+          else bat_icon = b >= 90 ? "\U000F0079" : b >= 70 ? "\U000F0081" : b >= 50 ? "\U000F007F"
+                        : b >= 30 ? "\U000F007D" : b >= 15 ? "\U000F007B" : "\U000F008E";
+        }
+        int w_bat = bat_icon ? text_width(bat_icon, id(i_small)) + 4 + text_width(bat, id(f_small)) + 16 : 0;
+        int w_time = footer[0] ? text_width(clock_icon, id(i_small)) + 8 + text_width(footer, id(f_small)) : 0;
+        int cw = w_bat + w_time + 28;
+        if (cw > 28) {
+          int x = 790 - cw;
+          box(x, y0, cw, bar_h, 10);
+          x += 14;
+          if (bat_icon) {
+            it.print(x, cy, id(i_small), INK, TextAlign::CENTER_LEFT, bat_icon);
+            x += text_width(bat_icon, id(i_small)) + 4;
+            it.print(x, cy, id(f_small), INK, TextAlign::CENTER_LEFT, bat);
+            x += text_width(bat, id(f_small)) + 16;
+          }
+          if (footer[0]) {
+            it.print(x, cy, id(i_small), INK, TextAlign::CENTER_LEFT, clock_icon);
+            x += text_width(clock_icon, id(i_small)) + 8;
+            it.print(x, cy, id(f_small), INK, TextAlign::CENTER_LEFT, footer);
+          }
+        }
+      }

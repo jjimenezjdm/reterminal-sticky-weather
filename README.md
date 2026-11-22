@@ -38,35 +38,34 @@ No Home Assistant, hub or server needed: the Sticky fetches everything itself ov
 ## Setup
 
 1. Install ESPHome **2026.7.0 or newer** (`brew install esphome` or `pip install esphome`).
-2. Copy `secrets.example.yaml` to `secrets.yaml` and fill in your Wi-Fi, an OTA password, your location and timezone.
+2. Copy `secrets.example.yaml` to `secrets.yaml` and fill in your Wi-Fi, an OTA password, your location (`latitude`, `longitude`) and `timezone`.
 3. Connect the Sticky with a **data** USB-C cable and flash it:
    ```bash
-   esphome run sticky-casa.yaml
+   esphome run sticky-weather.yaml
    ```
    This replaces the stock firmware (Seeedash).
 4. Later updates can go over Wi-Fi: wake it in maintenance mode (hold ▲ + press AI), then
    ```bash
-   esphome upload sticky-casa.yaml --device <sticky-ip>
+   esphome upload sticky-weather.yaml --device <sticky-ip>
    ```
 
-The Sticky's USB-C port is wired to a CH343P USB-UART on `UART0`, so logs are only visible over the cable (`esphome logs sticky-casa.yaml`).
+The Sticky's USB-C port is wired to a CH343P USB-UART on `UART0`, so logs are only visible over the cable (`esphome logs sticky-weather.yaml`).
 
 ## Configuration
 
-Everything adjustable is in the `substitutions:` block at the top of `sticky-casa.yaml`:
+Everything adjustable is in the `substitutions:` block at the top of `sticky-weather.yaml`:
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `umbral_mmh` | `0.2` | Rain (mm/h) from which it tells you to take an umbrella |
-| `minutos_dia` | `30` | Update interval outside peak windows (minutes) |
-| `minutos_punta` | `10` | Update interval inside peak windows |
-| `punta1`, `punta2` | `12:30–13:30`, `17:30–18:30` | Peak windows, as minutes since midnight |
-| `hora_dormir` / `hora_despertar` | `0` / `6` | No updates between these hours |
-| `bateria_ahorro` / `bateria_aviso` | `20` / `15` | Battery % for saving mode / on-screen warning |
+| `rain_threshold_mmh` | `0.2` | Rain (mm/h) from which it tells you to take an umbrella |
+| `interval_min` | `30` | Update interval outside peak windows (minutes) |
+| `peak_interval_min` | `10` | Update interval inside peak windows |
+| `peak1`, `peak2` | `12:30–13:30`, `17:30–18:30` | Peak windows, as minutes since midnight |
+| `night_start_hour` / `night_end_hour` | `0` / `6` | No updates between these hours |
+| `battery_saver_pct` / `battery_warning_pct` | `20` / `15` | Battery % for saving mode / on-screen warning |
 
 The indoor sensor sits inside the case, so it can read a bit high, especially while charging. Uncomment the `offset` filter under `sht4x` to calibrate it against another thermometer.
 
-*Code comments are in Spanish; the on-screen texts are in English.*
 
 ## Caveats
 
